@@ -1,12 +1,14 @@
 ﻿using BSPEngine;
+using BSPGenerationTools;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
+using System.Reflection;
+using System.Threading;
 
 namespace AtmelStartSDKImporter
 {
@@ -24,7 +26,7 @@ namespace AtmelStartSDKImporter
 
         public string Target => "arm-eabi";
 
-        public bool IsCompatibleWithToolchain(LoadedToolchain toolchain)
+		public bool IsCompatibleWithToolchain(LoadedToolchain toolchain)
         {
             var id = toolchain?.Toolchain?.GNUTargetID?.ToLower();
             return id?.Contains("arm") ?? true;
@@ -248,7 +250,41 @@ namespace AtmelStartSDKImporter
             return memories.ToArray();
         }
 
-        public static BoardSupportPackage GenerateBSPForSTARTProject(string extractedProjectDirectory, IWarningSink sink)
+		void DeleteDirectoryWithRetries(string dir)
+		{
+			for (int retry = 0; ; retry++)
+			{
+				try
+				{
+					Directory.Delete(dir, true);
+					return;
+				}
+				catch
+				{
+					try
+					{
+						if (Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length == 0)
+							return;
+					}
+					catch
+					{
+					}
+
+					if (retry >= 5)
+						throw;
+
+					Thread.Sleep(200);
+				}
+			}
+		}
+
+		/// <summary>
+		/// 
+		/// </summary>
+		/// <param name="extractedProjectDirectory"></param>
+		/// <param name="sink"></param>
+		/// <returns></returns>
+		public static BoardSupportPackage GenerateBSPForSTARTProject(string extractedProjectDirectory, IWarningSink sink)
         {
             var gpdscFile = Path.Combine(extractedProjectDirectory, "AtmelStart.gpdsc");
             if (!File.Exists(gpdscFile))
@@ -272,50 +308,15 @@ namespace AtmelStartSDKImporter
             if (device == null)
                 throw new Exception($"Could not find the device ID in {gpdscFile}");
 
-            var linkerScripts = DetectLinkerScripts(extractedProjectDirectory);
-            var memories = ScanLinkerScriptForMemories(Path.Combine(extractedProjectDirectory, linkerScripts.RelativeFLASHScript));
-
             var flagsFromMakefile = ScanMakefileForCommonFlags(gccMakefile);
-
-            var mcu = new MCU
-            {
-                ID = device,
-                FamilyID = "ATSTART",
-
-                FLASHBase = (uint)(memories.FirstOrDefault(m => m.Name == "rom")?.Address ?? uint.MaxValue),
-                FLASHSize = (int)(memories.FirstOrDefault(m => m.Name == "rom")?.Size ?? uint.MaxValue),
-
-                RAMBase = (uint)(memories.FirstOrDefault(m => m.Name == "ram")?.Address ?? uint.MaxValue),
-                RAMSize = (int)(memories.FirstOrDefault(m => m.Name == "ram")?.Size ?? uint.MaxValue),
-
-                CompilationFlags = new ToolFlags
-                {
-                    PreprocessorMacros = new[] { $"__{device}__" },
-                    COMMONFLAGS = string.Join(" ", flagsFromMakefile.CommonFlags),
-                    LinkerScript = linkerScripts.LinkerScriptFormat,
-                    IncludeDirectories = flagsFromMakefile.RelativeIncludeDirs?.Select(d => "$$SYS:BSP_ROOT$$/" + d).ToArray(),
-                    LDFLAGS = "-Wl,--entry=Reset_Handler", //Unless this is specified explicitly, the gdb's "load" command won't set $pc to the entry point, requiring an explicit device reset.
-                },
-
-                ConfigurableProperties = new PropertyList
-                {
-                    PropertyGroups = new[] { linkerScripts.ToPropertyGroup() }.Where(g => g != null).ToList()
-                },
-
-                MemoryMap = new AdvancedMemoryMap
-                {
-                    Memories = memories.ToArray()
-                }
-            };
 
             var bsp = new BoardSupportPackage
             {
-                PackageID = "com.sysprogs.atstart." + device,
+                PackageID = "com.sysprogs.arm.samd21",
                 GNUTargetID = "arm-eabi",
-                PackageDescription = $"{device} Support",
+                PackageDescription = $"ATSAMD21 Support",
                 BSPImporterID = ID,
-                MCUFamilies = new[] { new MCUFamily { ID = "ATSTART" } },
-                SupportedMCUs = new[] { mcu },
+                MCUFamilies = new[] { new MCUFamily { ID = "ATSAMD21" } },
                 Frameworks = xml.SelectNodes("package/components/component").OfType<XmlElement>().Select(GenerateFrameworkForComponent).Where(f => f != null).ToArray(),
 
                 EmbeddedSamples = new[]
@@ -331,18 +332,159 @@ namespace AtmelStartSDKImporter
                                 SourcePath = "$$SYS:BSP_ROOT$$/main.c",
                                 TargetFileName = "$$PROJECTNAME$$.c",
                             }
-                        }
+						}
                     }
                 }
             };
+			List<MCU> mcus =  new List<MCU>();
+			Dictionary<string, int> headers = new Dictionary<string, int>();
+			string[] strFileMCU = File.ReadAllLines("../../McuAtmel.csv");
+			bool header_row = true;
+			var linkerScripts = DetectLinkerScripts(extractedProjectDirectory);
+			for (int il = 0; il < strFileMCU.Length; il++)
+			{
+				string line = strFileMCU[il];
+				string[] items = line.Split(',');
 
-            FixGPDSCErrors(bsp, mcu, extractedProjectDirectory, flagsFromMakefile, linkerScripts.RelativeFLASHScript);
+				if (header_row)
+				{
+					for (int i = 0; i < items.Length; i++)
+						headers[items[i]] = i;
 
-            XmlTools.SaveObject(bsp, Path.Combine(extractedProjectDirectory, LoadedBSP.PackageFileName));
+					header_row = false;
+					continue;
+				}
+				String size = items[headers["Device Name"]].Substring(9, 2);
+				String LinkerScriptLocation = linkerScripts.RelativeFLASHScript.Substring(0, linkerScripts.RelativeFLASHScript.LastIndexOf("/")) + "/samd21g" + size + "_flash.ld";
+				var memories = ScanLinkerScriptForMemories(Path.Combine(extractedProjectDirectory, LinkerScriptLocation));
+				LinkerScriptLocation = LinkerScriptLocation.Replace("*", "$$com.sysprogs.bspoptions.primary_memory$$");
+
+				LinkerScriptLocation = "$$SYS:BSP_ROOT$$/" + LinkerScriptLocation;
+				var newMcu = new MCU
+				{
+					ID = items[headers["Device Name"]],
+					FamilyID = "ATSAMD21",
+
+					FLASHBase = (uint)0,
+					FLASHSize = Int32.Parse(items[headers["Flash (kBytes)"]]),
+
+					RAMBase = (uint)536870912,
+					RAMSize = Int32.Parse(items[headers["SRAM (kBytes)"]]),
+
+					CompilationFlags = new ToolFlags
+					{
+						PreprocessorMacros = new[] { $"__{items[headers["Device Name"]]}__" },
+						COMMONFLAGS = string.Join(" ", flagsFromMakefile.CommonFlags),
+						LinkerScript = linkerScripts.LinkerScriptFormat,
+						IncludeDirectories = flagsFromMakefile.RelativeIncludeDirs?.Select(d => "$$SYS:BSP_ROOT$$/" + d).ToArray(),
+						LDFLAGS = "-Wl,--entry=Reset_Handler", //Unless this is specified explicitly, the gdb's "load" command won't set $pc to the entry point, requiring an explicit device reset.
+					},
+
+					ConfigurableProperties = new PropertyList
+					{
+						PropertyGroups = new[] { linkerScripts.ToPropertyGroup() }.Where(g => g != null).ToList()
+					},
+
+					MemoryMap = new AdvancedMemoryMap
+					{
+						Memories = memories.ToArray()
+					}
+				};
+				FixGPDSCErrors(bsp, newMcu, extractedProjectDirectory, flagsFromMakefile, linkerScripts.RelativeFLASHScript);
+				mcus.Add(newMcu);
+
+			}
+			bsp.SupportedMCUs = mcus.ToArray();
+			List<AdditionalSourceFile> sourceFilesList = bsp.EmbeddedSamples[0].AdditionalSourcesToCopy.ToList();
+			IEnumerable<String> files = Directory.EnumerateFiles(extractedProjectDirectory);
+			foreach(String item in files)
+			{
+				String target = "";
+				if (item.EndsWith(".h")){
+					target = "inc/" + Path.GetFileName(item);
+				}else if (item.EndsWith(".c"))
+				{
+					target = "src/" + Path.GetFileName(item);
+				}
+				else
+				{
+					continue;
+				}
+				AdditionalSourceFile a = new AdditionalSourceFile
+				{
+					SourcePath = "$$SYS:BSP_ROOT$$/"+ Path.GetFileName(item),
+					TargetFileName = target,
+				};
+				sourceFilesList.Add(a);
+			}
+			files = Directory.EnumerateFiles(extractedProjectDirectory+"/config");
+			foreach (String item in files)
+			{
+				String target = "";
+				if (item.EndsWith(".h"))
+				{
+					target = "config/" + Path.GetFileName(item);
+				}
+				else
+				{
+					continue;
+				}
+				AdditionalSourceFile a = new AdditionalSourceFile
+				{
+					SourcePath = "$$SYS:BSP_ROOT$$/config/"+Path.GetFileName(item),
+					TargetFileName = target,
+				};
+				sourceFilesList.Add(a);
+			}
+			bsp.EmbeddedSamples[0].AdditionalSourcesToCopy = sourceFilesList.ToArray();
+			String path = Path.Combine(extractedProjectDirectory, LoadedBSP.PackageFileName);
+
+			XmlTools.SaveObject(bsp, path);
             return bsp;
         }
+		public class BSPSummary
+		{
+			public class MCU
+			{
+				public string Name;
+				public string UserFriendlyName;
+				public int FLASHSize;
+				public int RAMSize;
+			}
 
-        private static void FixGPDSCErrors(BoardSupportPackage bsp, MCU mcu, string extractedProjectDirectory, FlagsFromMakefile flagsFromMakefile, string relativeFLASHScript)
+			public List<MCU> MCUs = new List<MCU>();
+			public string BSPID;
+			public string BSPName;
+			public string BSPVersion;
+			public string MinimumEngineVersion;
+			public string FileName;
+		}
+
+		public static void Save(BoardSupportPackage bsp, String BSPRoot)
+		{
+
+			XmlTools.SaveObject(bsp, Path.Combine(BSPRoot, "BSP.XML"));
+
+			string archiveName = string.Format("{0}-{1}.vgdbxbsp", bsp.PackageID.Split('.').Last(), bsp.PackageVersion);
+
+			TarPacker.PackDirectoryToTGZ(BSPRoot, Path.Combine(BSPRoot, archiveName), fn => Path.GetExtension(fn).ToLower() != ".vgdbxbsp");
+
+			BSPSummary lst = new BSPSummary
+			{
+				BSPName = bsp.PackageDescription,
+				BSPID = bsp.PackageID,
+				BSPVersion = bsp.PackageVersion,
+				MinimumEngineVersion = bsp.MinimumEngineVersion,
+				FileName = archiveName,
+			};
+
+			foreach (var mcu in bsp.SupportedMCUs)
+				lst.MCUs.Add(new BSPSummary.MCU { Name = mcu.ID, FLASHSize = mcu.FLASHSize, RAMSize = mcu.RAMSize, UserFriendlyName = mcu.UserFriendlyName });
+
+			XmlTools.SaveObject(lst, Path.Combine(BSPRoot, Path.ChangeExtension(archiveName, ".xml")));
+		}
+
+		private static void FixGPDSCErrors(BoardSupportPackage bsp, MCU mcu, string extractedProjectDirectory, FlagsFromMakefile flagsFromMakefile, string relativeFLASHScript)
         {
             //1. Startup files may not be referenced in the GPDSC file
             string[] startupFiles = Directory.GetFiles(Path.Combine(extractedProjectDirectory, Path.GetDirectoryName(relativeFLASHScript)), "*.c")

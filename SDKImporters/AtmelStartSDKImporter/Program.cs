@@ -1,4 +1,6 @@
 ﻿using BSPEngine;
+using BSPGenerationTools;
+using LinkerScriptGenerator;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -16,7 +18,7 @@ namespace AtmelStartSDKImporter
             }
         }
 
-        static void Main(string[] args)
+		static void Main(string[] args)
         {
             if (args.Length < 1)
             {
@@ -26,7 +28,9 @@ namespace AtmelStartSDKImporter
             }
 
             string sdkDir = args[0];
-            AtmelStartPackageParser.GenerateBSPForSTARTProject(args[0], new ConsoleWarningSink());
-        }
+            BoardSupportPackage BSP =AtmelStartPackageParser.GenerateBSPForSTARTProject(args[0], new ConsoleWarningSink());
+			AtmelStartPackageParser.Save(BSP, args[0]);
+
+		}
     }
 }
